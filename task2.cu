@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include "png_utils.h"
 #include <cuda_runtime.h>
+#include <time.h>
 
 #define SIGMA 25.0f
 #define FILTER_SIZE 31
@@ -95,8 +96,15 @@ void generateGaussianFilter(float* filter, int filterSize, float sigma) {
 }
 
 int main() {
+    struct timespec mainStart, mainEnd;
+    clock_gettime(CLOCK_MONOTONIC, &mainStart);
+
     int width, height;
+    struct timespec readStart, readEnd;
+    clock_gettime(CLOCK_MONOTONIC, &readStart);
     unsigned char* h_inputImage = readPNG("input.png", &width, &height);
+    clock_gettime(CLOCK_MONOTONIC, &readEnd);
+
     if (!h_inputImage) {
         printf("Не удалось прочитать входное изображение\n");
         return -1;
@@ -107,7 +115,11 @@ int main() {
     cudaMalloc(&d_inputImage, imageSize);
     cudaMalloc(&d_outputImageShared, imageSize);
     cudaMalloc(&d_outputImageTexture, imageSize);
+
+    struct timespec dataTransferStart, dataTransferEnd;
+    clock_gettime(CLOCK_MONOTONIC, &dataTransferStart);
     cudaMemcpy(d_inputImage, h_inputImage, imageSize, cudaMemcpyHostToDevice);
+    clock_gettime(CLOCK_MONOTONIC, &dataTransferEnd);
 
     int filterWidth = FILTER_SIZE;
     size_t filterSize = filterWidth * filterWidth * sizeof(float);
@@ -131,7 +143,10 @@ int main() {
         h_inputImageRGBA[i * 4 + 3] = 255;
     }
 
+    struct timespec textureTransferStart, textureTransferEnd;
+    clock_gettime(CLOCK_MONOTONIC, &textureTransferStart);
     cudaMemcpyToArray(cuArray, 0, 0, h_inputImageRGBA, width * height * 4 * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    clock_gettime(CLOCK_MONOTONIC, &textureTransferEnd);
 
     cudaResourceDesc resDesc = {};
     resDesc.resType = cudaResourceTypeArray;
@@ -174,8 +189,11 @@ int main() {
     cudaMemcpy(h_outputImageShared, d_outputImageShared, imageSize, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_outputImageTexture, d_outputImageTexture, imageSize, cudaMemcpyDeviceToHost);
 
+    struct timespec writeStart, writeEnd;
+    clock_gettime(CLOCK_MONOTONIC, &writeStart);
     writePNG("output_shared.png", width, height, h_outputImageShared);
     writePNG("output_texture.png", width, height, h_outputImageTexture);
+    clock_gettime(CLOCK_MONOTONIC, &writeEnd);
 
     printf("Shared Memory Kernel Execution Time: %f ms\n", sharedTime);
     printf("Texture Memory Kernel Execution Time: %f ms\n", textureTime);
@@ -193,6 +211,27 @@ int main() {
     free(h_outputImageTexture);
     cudaEventDestroy(startEvent);
     cudaEventDestroy(stopEvent);
+
+    double dataTransferTime = (dataTransferEnd.tv_sec - dataTransferStart.tv_sec) * 1000.0 +
+                              (dataTransferEnd.tv_nsec - dataTransferStart.tv_nsec) / 1000000.0;
+    printf("Data Transfer to GPU Time: %f ms\n", dataTransferTime);
+
+    double textureTransferTime = (textureTransferEnd.tv_sec - textureTransferStart.tv_sec) * 1000.0 +
+                                 (textureTransferEnd.tv_nsec - textureTransferStart.tv_nsec) / 1000000.0;
+    printf("Texture Transfer to GPU Time: %f ms\n", textureTransferTime);
+
+    double readTime = (readEnd.tv_sec - readStart.tv_sec) * 1000.0 +
+                      (readEnd.tv_nsec - readStart.tv_nsec) / 1000000.0;
+    printf("PNG Read Time: %f ms\n", readTime);
+
+    double writeTime = (writeEnd.tv_sec - writeStart.tv_sec) * 1000.0 +
+                       (writeEnd.tv_nsec - writeStart.tv_nsec) / 1000000.0;
+    printf("PNG Write Time: %f ms\n", writeTime);
+
+    clock_gettime(CLOCK_MONOTONIC, &mainEnd);
+    double mainTime = (mainEnd.tv_sec - mainStart.tv_sec) * 1000.0 +
+                      (mainEnd.tv_nsec - mainStart.tv_nsec) / 1000000.0;
+    printf("Total Execution Time (main): %f ms\n", mainTime);
 
     return 0;
 }
