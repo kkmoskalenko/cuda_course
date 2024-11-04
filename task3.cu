@@ -94,44 +94,48 @@ void generateGaussianFilter(float* filter, int filterSize, float sigma) {
     }
 }
 
-int main() {
-    int width, height;
-    unsigned char* h_inputImage = readPNG("input.png", &width, &height);
-    if (!h_inputImage) {
-        printf("Не удалось прочитать входное изображение\n");
-        return -1;
+void processOnGPU(int deviceID, int numGPUs, unsigned char* h_inputImage, unsigned char* h_outputImageShared, unsigned char* h_outputImageTexture, 
+                  int width, int height, float* h_filter, int filterWidth, float sigma, float* sharedTime, float* textureTime) {
+    cudaSetDevice(deviceID);
+
+    int overlap = filterWidth / 2;
+    int segmentHeight = height / numGPUs;
+    int yOffset = segmentHeight * deviceID;
+
+    if (deviceID == numGPUs - 1) {
+        segmentHeight += height % numGPUs;
     }
-    size_t imageSize = width * height * 3 * sizeof(unsigned char);
 
+    int startRow = (deviceID == 0) ? 0 : yOffset - overlap;
+    int endRow = (deviceID == numGPUs - 1) ? height : yOffset + segmentHeight + overlap;
+    int segmentHeightWithOverlap = endRow - startRow;
+
+    size_t segmentSizeWithOverlap = width * segmentHeightWithOverlap * 3 * sizeof(unsigned char);
     unsigned char *d_inputImage, *d_outputImageShared, *d_outputImageTexture;
-    cudaMalloc(&d_inputImage, imageSize);
-    cudaMalloc(&d_outputImageShared, imageSize);
-    cudaMalloc(&d_outputImageTexture, imageSize);
-    cudaMemcpy(d_inputImage, h_inputImage, imageSize, cudaMemcpyHostToDevice);
+    cudaMalloc(&d_inputImage, segmentSizeWithOverlap);
+    cudaMalloc(&d_outputImageShared, segmentSizeWithOverlap);
+    cudaMalloc(&d_outputImageTexture, segmentSizeWithOverlap);
 
-    int filterWidth = FILTER_SIZE;
-    size_t filterSize = filterWidth * filterWidth * sizeof(float);
-    float* h_filter = (float*)malloc(filterSize);
-    float sigma = SIGMA;
-    generateGaussianFilter(h_filter, filterWidth, sigma);
+    cudaMemcpy(d_inputImage, h_inputImage + startRow * width * 3, segmentSizeWithOverlap, cudaMemcpyHostToDevice);
 
     float* d_filter;
+    size_t filterSize = filterWidth * filterWidth * sizeof(float);
     cudaMalloc(&d_filter, filterSize);
     cudaMemcpy(d_filter, h_filter, filterSize, cudaMemcpyHostToDevice);
 
     cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar4>();
     cudaArray_t cuArray;
-    cudaMallocArray(&cuArray, &channelDesc, width, height);
+    cudaMallocArray(&cuArray, &channelDesc, width, segmentHeightWithOverlap);
 
-    unsigned char* h_inputImageRGBA = (unsigned char*)malloc(width * height * 4);
-    for(int i = 0; i < width * height; i++) {
-        h_inputImageRGBA[i * 4 + 0] = h_inputImage[i * 3 + 0];
-        h_inputImageRGBA[i * 4 + 1] = h_inputImage[i * 3 + 1];
-        h_inputImageRGBA[i * 4 + 2] = h_inputImage[i * 3 + 2];
-        h_inputImageRGBA[i * 4 + 3] = 255;
+    unsigned char* h_inputImageSegmentRGBA = (unsigned char*)malloc(width * segmentHeightWithOverlap * 4);
+    for (int i = 0; i < width * segmentHeightWithOverlap; i++) {
+        h_inputImageSegmentRGBA[i * 4 + 0] = h_inputImage[(startRow * width + i) * 3 + 0];
+        h_inputImageSegmentRGBA[i * 4 + 1] = h_inputImage[(startRow * width + i) * 3 + 1];
+        h_inputImageSegmentRGBA[i * 4 + 2] = h_inputImage[(startRow * width + i) * 3 + 2];
+        h_inputImageSegmentRGBA[i * 4 + 3] = 255;
     }
 
-    cudaMemcpyToArray(cuArray, 0, 0, h_inputImageRGBA, width * height * 4 * sizeof(unsigned char), cudaMemcpyHostToDevice);
+    cudaMemcpyToArray(cuArray, 0, 0, h_inputImageSegmentRGBA, width * segmentHeightWithOverlap * 4 * sizeof(unsigned char), cudaMemcpyHostToDevice);
 
     cudaResourceDesc resDesc = {};
     resDesc.resType = cudaResourceTypeArray;
@@ -148,37 +152,32 @@ int main() {
     cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL);
 
     dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
-                  (height + blockSize.y - 1) / blockSize.y);
+    dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (segmentHeightWithOverlap + blockSize.y - 1) / blockSize.y);
     size_t sharedMemSize = (blockSize.x + FILTER_SIZE - 1) * (blockSize.y + FILTER_SIZE - 1) * 3 * sizeof(unsigned char);
 
     cudaEvent_t startEvent, stopEvent;
-    float sharedTime, textureTime;
     cudaEventCreate(&startEvent);
     cudaEventCreate(&stopEvent);
 
     cudaEventRecord(startEvent);
-    convolutionShared<<<gridSize, blockSize, sharedMemSize>>>(d_inputImage, d_outputImageShared, width, height, d_filter, FILTER_SIZE);
+    convolutionShared<<<gridSize, blockSize, sharedMemSize>>>(d_inputImage, d_outputImageShared, width, segmentHeightWithOverlap, d_filter, FILTER_SIZE);
     cudaEventRecord(stopEvent);
     cudaEventSynchronize(stopEvent);
-    cudaEventElapsedTime(&sharedTime, startEvent, stopEvent);
+    cudaEventElapsedTime(sharedTime, startEvent, stopEvent);
 
     cudaEventRecord(startEvent);
-    convolutionTexture<<<gridSize, blockSize>>>(texObj, d_outputImageTexture, width, height, d_filter, FILTER_SIZE);
+    convolutionTexture<<<gridSize, blockSize>>>(texObj, d_outputImageTexture, width, segmentHeightWithOverlap, d_filter, FILTER_SIZE);
     cudaEventRecord(stopEvent);
     cudaEventSynchronize(stopEvent);
-    cudaEventElapsedTime(&textureTime, startEvent, stopEvent);
+    cudaEventElapsedTime(textureTime, startEvent, stopEvent);
 
-    unsigned char* h_outputImageShared = (unsigned char*)malloc(imageSize);
-    unsigned char* h_outputImageTexture = (unsigned char*)malloc(imageSize);
-    cudaMemcpy(h_outputImageShared, d_outputImageShared, imageSize, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_outputImageTexture, d_outputImageTexture, imageSize, cudaMemcpyDeviceToHost);
+    int copyStartRow = (deviceID == 0) ? 0 : overlap;
+    int copyEndRow = (deviceID == numGPUs - 1) ? segmentHeightWithOverlap : segmentHeightWithOverlap - overlap;
+    int copyHeight = copyEndRow - copyStartRow;
+    size_t centralSegmentSize = width * copyHeight * 3 * sizeof(unsigned char);
 
-    writePNG("output_shared.png", width, height, h_outputImageShared);
-    writePNG("output_texture.png", width, height, h_outputImageTexture);
-
-    printf("Shared Memory Kernel Execution Time: %f ms\n", sharedTime);
-    printf("Texture Memory Kernel Execution Time: %f ms\n", textureTime);
+    cudaMemcpy(h_outputImageShared + yOffset * width * 3, d_outputImageShared + copyStartRow * width * 3, centralSegmentSize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_outputImageTexture + yOffset * width * 3, d_outputImageTexture + copyStartRow * width * 3, centralSegmentSize, cudaMemcpyDeviceToHost);
 
     cudaDestroyTextureObject(texObj);
     cudaFreeArray(cuArray);
@@ -186,13 +185,53 @@ int main() {
     cudaFree(d_outputImageShared);
     cudaFree(d_outputImageTexture);
     cudaFree(d_filter);
-    free(h_filter);
-    free(h_inputImage);
-    free(h_inputImageRGBA);
-    free(h_outputImageShared);
-    free(h_outputImageTexture);
+    free(h_inputImageSegmentRGBA);
+
     cudaEventDestroy(startEvent);
     cudaEventDestroy(stopEvent);
+}
+
+int main() {
+    int width, height;
+    unsigned char* h_inputImage = readPNG("input.png", &width, &height);
+    if (!h_inputImage) {
+        printf("Не удалось прочитать входное изображение\n");
+        return -1;
+    }
+    int numGPUs;
+    cudaGetDeviceCount(&numGPUs);
+    printf("Number of GPUs available: %d\n", numGPUs);
+
+    float sigma = SIGMA;
+    int filterWidth = FILTER_SIZE;
+    size_t filterSize = filterWidth * filterWidth * sizeof(float);
+    float* h_filter = (float*)malloc(filterSize);
+    generateGaussianFilter(h_filter, filterWidth, sigma);
+
+    unsigned char* h_outputImageShared = (unsigned char*)malloc(width * height * 3 * sizeof(unsigned char));
+    unsigned char* h_outputImageTexture = (unsigned char*)malloc(width * height * 3 * sizeof(unsigned char));
+    float* sharedTimes = (float*)malloc(numGPUs * sizeof(float));
+    float* textureTimes = (float*)malloc(numGPUs * sizeof(float));
+
+    for (int i = 0; i < numGPUs; i++) {
+        printf("Processing on GPU %d\n", i);
+        processOnGPU(i, numGPUs, h_inputImage, h_outputImageShared, h_outputImageTexture, width, height, h_filter, filterWidth, sigma, &sharedTimes[i], &textureTimes[i]);
+    }
+
+    writePNG("output_shared.png", width, height, h_outputImageShared);
+    writePNG("output_texture.png", width, height, h_outputImageTexture);
+
+    for (int i = 0; i < numGPUs; i++) {
+        printf("GPU %d - Shared Memory Kernel Execution Time: %f ms\n", i, sharedTimes[i]);
+        printf("GPU %d - Texture Memory Kernel Execution Time: %f ms\n", i, textureTimes[i]);
+    }
+
+    free(h_filter);
+    free(h_inputImage);
+    free(h_outputImageShared);
+    free(h_outputImageTexture);
+    free(sharedTimes);
+    free(textureTimes);
 
     return 0;
 }
