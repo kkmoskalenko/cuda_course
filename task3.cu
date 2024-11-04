@@ -198,6 +198,10 @@ int main() {
         printf("Не удалось прочитать входное изображение\n");
         return -1;
     }
+
+    struct timespec mainStart, mainEnd;
+    clock_gettime(CLOCK_MONOTONIC, &mainStart);
+
     int numGPUs;
     cudaGetDeviceCount(&numGPUs);
     printf("Number of GPUs available: %d\n", numGPUs);
@@ -218,6 +222,10 @@ int main() {
         processOnGPU(i, numGPUs, h_inputImage, h_outputImageShared, h_outputImageTexture, width, height, h_filter, filterWidth, sigma, &sharedTimes[i], &textureTimes[i]);
     }
 
+    clock_gettime(CLOCK_MONOTONIC, &mainEnd);
+    double mainTime = (mainEnd.tv_sec - mainStart.tv_sec) * 1000.0 +
+                      (mainEnd.tv_nsec - mainStart.tv_nsec) / 1000000.0;
+
     writePNG("output_shared.png", width, height, h_outputImageShared);
     writePNG("output_texture.png", width, height, h_outputImageTexture);
 
@@ -225,6 +233,8 @@ int main() {
         printf("GPU %d - Shared Memory Kernel Execution Time: %f ms\n", i, sharedTimes[i]);
         printf("GPU %d - Texture Memory Kernel Execution Time: %f ms\n", i, textureTimes[i]);
     }
+
+    printf("Total Execution Time (without I/O): %f ms\n", mainTime);
 
     free(h_filter);
     free(h_inputImage);
